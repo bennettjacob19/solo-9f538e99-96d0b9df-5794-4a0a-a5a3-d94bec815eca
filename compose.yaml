@@ -1,0 +1,16 @@
+services:
+  memory-drill:
+    build: .
+    image: gsb-memory-drill:latest
+    container_name: gsb-memory-drill
+    ports:
+      - "${PORT:-8000}:8000"
+    environment:
+      DB_PATH: /data/sim.db
+      SECRET_KEY: ${SECRET_KEY:-compose-drill-secret}
+    volumes:
+      - memory-drill-data:/data
+    restart: unless-stopped
+
+volumes:
+  memory-drill-data:

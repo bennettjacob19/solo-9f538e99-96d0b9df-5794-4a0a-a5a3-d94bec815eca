@@ -1,0 +1,353 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>大页连续内存整理演练 · Flask + SQLite</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<header>
+  <div>
+    <h1>大页连续内存整理演练台</h1>
+    <p class="subtitle">
+      SQLite 模拟 16 个 4 KiB 槽与后备盘。选择首槽为 4 的倍数的连续 4 槽，
+      按“搬页 / 写回”限额整理；可在暂停整理期间让原虚拟机继续按磁盘页号读写，
+      并验证缺页重缓存、直读直写以及写回失败后的整批事务回滚。
+    </p>
+    <div class="stats">
+      <span class="chip">空槽 <b>{{ state.stats.free_slots }}</b></span>
+      <span class="chip">原VM占用 <b>{{ state.stats.old_vm_slots }}</b></span>
+      <span class="chip">脏页 <b>{{ state.stats.dirty_slots }}</b></span>
+      {% if state.active_target_start is not none %}
+        <span class="chip">区外空槽 <b>{{ state.stats.outside_free_slots }}</b></span>
+      {% else %}
+        <span class="chip">空闲槽 <b>{{ state.stats.free_slots }}</b>（目标 0 时区外仅 #15）</span>
+      {% endif %}
+      <span class="chip">新VM槽 <b>{{ state.stats.new_vm_slots }}</b></span>
+    </div>
+  </div>
+  <form method="post" action="{{ url_for('ui_reset') }}"
+        onsubmit="return confirm('确定恢复到初始样例？当前所有改写和批次都会清空。');">
+    <button class="danger" type="submit">重置样例</button>
+  </form>
+</header>
+
+<main>
+  {% with messages = get_flashed_messages(with_categories=true) %}
+    {% if messages %}
+      <section class="flash-stack" aria-live="polite">
+        {% for category, message in messages %}
+          <div class="flash {{ category or 'info' }}">{{ message }}</div>
+        {% endfor %}
+      </section>
+    {% endif %}
+  {% endwith %}
+
+  {% set batch = state.current_batch %}
+  {% if state.active_target_start is not none %}
+    {% set target_start = state.active_target_start %}
+    {% set target_preview = false %}
+  {% elif state.allocation %}
+    {% set target_start = state.allocation.target_start %}
+    {% set target_preview = false %}
+  {% else %}
+    {% set target_start = 0 %}
+    {% set target_preview = true %}
+  {% endif %}
+
+  <section class="panel" id="topology">
+    <h2>槽位归属（16 × 4 KiB）</h2>
+    {% if state.allocation %}
+      <div class="success-box">
+        最近分配：新虚拟机大页已占用槽
+        <b>{{ state.allocation.target_slots |join(', ') }}</b>
+        （首槽 {{ state.allocation.target_start }}，{{ state.allocation.allocated_at }}）。
+        原 VM 对这些槽的缓存映射已清除。
+      </div>
+    {% endif %}
+    <div class="slot-grid">
+      {% for s in state.slots %}
+        {% if s.owner == 'new-vm' %}
+          {% set cls = 'new' %}
+          {% set badge = '新VM大页' %}
+        {% elif s.owner == 'old-vm' and s.dirty %}
+          {% set cls = 'dirty' %}
+          {% set badge = '原VM · 脏' %}
+        {% elif s.owner == 'old-vm' %}
+          {% set cls = 'clean' %}
+          {% set badge = '原VM · 干净' %}
+        {% else %}
+          {% set cls = 'free' %}
+          {% set badge = '空槽' %}
+        {% endif %}
+        <div class="slot {{ cls }} {% if target_start is not none and s.slot_no >= target_start and s.slot_no < target_start + 4 %}target{% endif %}">
+          <div class="slot-no">
+            <span>#{{ '%02d'|format(s.slot_no) }}</span>
+            <span class="badge {{ cls }}">{{ badge }}</span>
+          </div>
+          <div class="slot-meta">
+            {% if s.page_id is not none %}
+              磁盘页号：<b>P{{ '%02d'|format(s.page_id) }}</b><br>
+              状态：{{ '脏，内容最新' if s.dirty else '与盘一致' }}
+            {% else %}
+              未缓存页
+            {% endif %}
+          </div>
+          {% if s.content %}
+            <div class="content-excerpt mono">{{ s.content }}</div>
+          {% endif %}
+          {% if target_start is not none and s.slot_no >= target_start and s.slot_no < target_start + 4 %}
+            <div class="target-flag">{% if target_preview %}样例目标{% else %}目标区{% endif %}</div>
+          {% endif %}
+        </div>
+      {% endfor %}
+    </div>
+    <div class="legend">
+      <span class="l-free">空槽 / 保留目标</span>
+      <span class="l-clean">原 VM 干净缓存</span>
+      <span class="l-dirty">原 VM 脏缓存</span>
+      <span class="l-new">已分配新 VM</span>
+      <span>蓝色描边为当前 4 槽目标区；缺页重缓存只会使用目标区之外的空槽。</span>
+    </div>
+  </section>
+
+  <div class="grid-two">
+    <section class="panel" id="compact">
+      <h2>1. 选择连续 4 槽与本批限额</h2>
+      <form method="post" action="{{ url_for('ui_create_batch') }}">
+        <div class="form-grid">
+          <label class="field">首槽编号（必须是 4 的倍数）
+            <select name="target_start">
+              {% for start in state.choices.target_starts %}
+                <option value="{{ start }}" {% if batch and batch.target_start == start %}selected{% elif not batch and start == 0 %}selected{% endif %}>
+                  {{ start }} — {{ start + 3 }} 槽
+                </option>
+              {% endfor %}
+            </select>
+          </label>
+          <label class="field">允许搬页数
+            <input type="number" name="move_quota" min="0" max="4"
+                   value="{{ batch.move_quota if batch else 1 }}">
+          </label>
+          <label class="field">允许写回页数
+            <input type="number" name="writeback_quota" min="0" max="4"
+                   value="{{ batch.writeback_quota if batch else 1 }}">
+          </label>
+          <label class="check-field">
+            <input type="checkbox" name="fail_enabled" value="1"
+                   {% if batch and batch.fail_on_writeback_index > 0 %}checked{% endif %}>
+            模拟第
+            <input style="width:64px" type="number" name="fail_index" min="1" max="9"
+                   value="{{ batch.fail_on_writeback_index if batch and batch.fail_on_writeback_index > 0 else 1 }}">
+            次写回失败
+          </label>
+        </div>
+        <div class="btn-row">
+          <button type="submit" name="action" value="pause">选定本批动作并暂停整理</button>
+          <button class="secondary" type="submit" name="action" value="run">选定并直接执行</button>
+        </div>
+      </form>
+
+      {% if batch %}
+        <h3>当前/最近批次 #{{ batch.id }}
+          <span class="status {{ batch.status }}">
+            {% if batch.status == 'paused' %}整理暂停中
+            {% elif batch.status == 'rolled_back' %}失败已回滚，可继续重试
+            {% elif batch.status == 'applied' %}本批已完成，尚差槽位
+            {% elif batch.status == 'allocated' %}四槽已分配新VM
+            {% else %}{{ batch.status }}{% endif %}
+          </span>
+        </h3>
+
+        {% if batch.error %}
+          <div class="error-box"><b>写回失败 / 回滚：</b>{{ batch.error }}</div>
+        {% endif %}
+
+        <p class="small muted">
+          目标槽 <b>{{ batch.target_slots |join(', ') }}</b>；
+          搬页限额 {{ batch.move_quota }}，写回限额 {{ batch.writeback_quota }}；
+          故障注入：第 {{ batch.fail_on_writeback_index if batch.fail_on_writeback_index else '—' }} 次写回。
+        </p>
+
+        {% if batch.preliminary_plan %}
+          <h3>选定时的初定动作</h3>
+          <div class="count-line">
+            <span class="count-pill free">已空 {{ batch.preliminary_plan.already_free }}</span>
+            <span class="count-pill clean">干净直释 {{ batch.preliminary_plan.clean_releases }}</span>
+            <span class="count-pill move">搬页 {{ batch.preliminary_plan.moves }}</span>
+            <span class="count-pill wb">写回 {{ batch.preliminary_plan.writebacks }}</span>
+            <span class="count-pill">暂缓 {{ batch.preliminary_plan.deferred }}</span>
+          </div>
+          <ul class="plan-list">
+            {% for a in batch.preliminary_plan.actions %}
+              <li class="{{ a.type }}">{{ a.label }}</li>
+            {% endfor %}
+          </ul>
+        {% endif %}
+
+        {% if state.live_plan and batch.status in ['paused', 'rolled_back'] %}
+          <h3>继续时将按当前脏页/空槽重算</h3>
+          {% if state.live_plan.error %}
+            <div class="error-box">{{ state.live_plan.error }}</div>
+          {% else %}
+            <div class="count-line">
+              <span class="count-pill free">区外空槽 {{ state.live_plan.outside_free_slots |length }}</span>
+              <span class="count-pill clean">干净直释 {{ state.live_plan.clean_releases }}</span>
+              <span class="count-pill move">实际计划搬页 {{ state.live_plan.moves }}</span>
+              <span class="count-pill wb">实际计划写回 {{ state.live_plan.writebacks }}</span>
+              <span class="count-pill">暂缓 {{ state.live_plan.deferred }}</span>
+            </div>
+            <ul class="plan-list">
+              {% for a in state.live_plan.actions %}
+                <li class="{{ a.type }}">{{ a.label }}</li>
+              {% endfor %}
+            </ul>
+          {% endif %}
+
+          <form method="post" action="{{ url_for('ui_resume_batch') }}">
+            <input type="hidden" name="batch_id" value="{{ batch.id }}">
+            <div class="btn-row">
+              <button class="success" type="submit" name="clear_fault" value="0">继续：重算并执行本批</button>
+              <button class="secondary" type="submit" name="clear_fault" value="1">清除故障后继续</button>
+            </div>
+          </form>
+
+          <form method="post" action="{{ url_for('ui_update_fault') }}" class="small">
+            <input type="hidden" name="batch_id" value="{{ batch.id }}">
+            <div class="form-grid" style="margin-top:12px">
+              <label class="check-field">
+                <input type="checkbox" name="fail_enabled" value="1"
+                       {% if batch.fail_on_writeback_index > 0 %}checked{% endif %}>
+                令第 <input style="width:64px" type="number" name="fail_index" min="1" max="9"
+                           value="{{ batch.fail_on_writeback_index if batch.fail_on_writeback_index > 0 else 1 }}">
+                次写回失败
+              </label>
+            </div>
+            <div class="btn-row"><button type="submit" class="ghost">更新故障注入</button></div>
+          </form>
+        {% endif %}
+
+        {% if batch.result %}
+          <h3>{% if batch.result.rolled_back %}回滚后持久实际结果{% else %}实际结果{% endif %}</h3>
+          <div class="count-line">
+            <span class="count-pill move">实际搬页 {{ batch.result.actual_moves }}</span>
+            <span class="count-pill wb">实际写回 {{ batch.result.actual_writebacks }}</span>
+            <span class="count-pill clean">干净释放 {{ batch.result.actual_clean_releases }}</span>
+            <span class="count-pill {{ 'free' if batch.result.allocated_to_new_vm else '' }}">
+              {{ '已分配新VM' if batch.result.allocated_to_new_vm else ('已全部回滚' if batch.result.rolled_back else '尚未腾齐') }}
+            </span>
+          </div>
+          {% if batch.result.rolled_back and batch.result.attempted_before_failure %}
+            <div class="error-box">
+              失败前同一事务内曾执行：搬页
+              {{ batch.result.attempted_before_failure.moves }}、
+              成功写回 {{ batch.result.attempted_before_failure.writebacks_before_failed_ordinal }}、
+              干净释放 {{ batch.result.attempted_before_failure.clean_releases }}；
+              ROLLBACK 后这些本批改动均不保留。
+            </div>
+          {% endif %}
+          <ul class="plan-list">
+            {% for a in batch.result.executed_actions or [] %}
+              <li class="{{ a.type }}">✓ {{ a.label }}</li>
+            {% endfor %}
+          </ul>
+        {% endif %}
+
+        <form method="post" action="{{ url_for('ui_cancel') }}">
+          <div class="btn-row"><button class="ghost" type="submit">取消当前目标</button></div>
+        </form>
+      {% else %}
+        <div class="info-box" style="margin-top:14px">
+          初始样例建议：首槽 0，搬页限额 1，写回限额 1。暂停后改写 P0/P1，再继续观察重算与最新内容搬迁/写回。
+        </div>
+      {% endif %}
+    </section>
+
+    <section class="panel" id="vm">
+      <h2>2. 原虚拟机按磁盘页号读写</h2>
+      <p class="small muted">
+        命中则使用当前缓存并可读到暂停期最新改写；缺页时优先使用目标区外空槽重新缓存；
+        区外无空槽则直读/直写后备盘。四槽分配后，原 VM 不会再使用新 VM 持有的槽。
+      </p>
+
+      <div class="quick-pages">
+        {% for pid in [0, 1, 2, 14, 15, 16] %}
+          <form method="post" action="{{ url_for('ui_guest') }}" class="inline">
+            <input type="hidden" name="page_id" value="{{ pid }}">
+            <input type="hidden" name="op" value="read">
+            <button type="submit">读 P{{ '%02d'|format(pid) }}</button>
+          </form>
+        {% endfor %}
+      </div>
+
+      <form method="post" action="{{ url_for('ui_guest') }}">
+        <div class="form-grid">
+          <label class="field">磁盘页号（0–31）
+            <input type="number" name="page_id" min="0" max="31" value="0" required>
+          </label>
+        </div>
+        <label class="field" style="margin-top:10px">写入内容（整页文本模拟，≤4096 字节）
+          <textarea name="content" placeholder="输入本页最新内容；写入命中槽会标记为脏"></textarea>
+        </label>
+        <div class="btn-row">
+          <button type="submit" name="op" value="read">读取该页</button>
+          <button class="success" type="submit" name="op" value="write">写入内容</button>
+        </div>
+      </form>
+
+      <form method="post" action="{{ url_for('ui_guest') }}" class="btn-row">
+        <input type="hidden" name="op" value="write">
+        <input type="hidden" name="marker" value="1">
+        <label class="field" style="min-width:150px">页号
+          <input type="number" name="page_id" min="0" max="31" value="0">
+        </label>
+        <button class="secondary" type="submit">写入带时间戳的最新标记</button>
+      </form>
+
+      <h3>后备盘 / 页号对照表</h3>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>页号</th><th>当前缓存槽</th><th>写盘次数</th><th>后备盘内容</th></tr>
+          </thead>
+          <tbody>
+            {% for p in state.disk_pages %}
+              <tr>
+                <td class="mono">P{{ '%02d'|format(p.page_id) }}</td>
+                <td>
+                  {% if p.cached_slot is not none %}
+                    #{{ '%02d'|format(p.cached_slot) }}
+                  {% else %}
+                    <span class="muted">未缓存 / 直写可能已更新</span>
+                  {% endif %}
+                </td>
+                <td>{{ p.write_count }}</td>
+                <td class="mono small">{{ p.content }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </div>
+
+  <section class="panel" style="margin-top:18px">
+    <h2>事件日志</h2>
+    <ul class="event-list">
+      {% for e in state.events %}
+        <li class="{{ e.kind }}">
+          <span class="ts mono">{{ e.ts }}</span>{{ e.message }}
+        </li>
+      {% endfor %}
+    </ul>
+  </section>
+
+  <p class="muted small">
+    JSON API：<code>GET /api/state</code>、<code>POST /api/batches</code>、
+    <code>POST /api/batches/&lt;id&gt;/resume</code>、
+    <code>POST /api/guest/read</code>、<code>POST /api/guest/write</code>。
+  </p>
+</main>
+</body>
+</html>
